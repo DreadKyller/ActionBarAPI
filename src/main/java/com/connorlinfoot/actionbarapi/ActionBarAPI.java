@@ -10,13 +10,13 @@ import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 
 public class ActionBarAPI extends JavaPlugin implements Listener {
     private static Plugin plugin;
-    private static String nmsver;
     private static boolean useOldMethods = false;
 
     public void onEnable() {
@@ -29,7 +29,7 @@ public class ActionBarAPI extends JavaPlugin implements Listener {
         Server server = getServer();
         ConsoleCommandSender console = server.getConsoleSender();
 
-        nmsver = Bukkit.getServer().getClass().getPackage().getName();
+        String nmsver = Bukkit.getServer().getClass().getPackage().getName();
         nmsver = nmsver.substring(nmsver.lastIndexOf(".") + 1);
 
         if (nmsver.equalsIgnoreCase("v1_8_R1") || nmsver.startsWith("v1_7_")) { // Not sure if 1_7 works for the protocol hack?
@@ -38,12 +38,114 @@ public class ActionBarAPI extends JavaPlugin implements Listener {
 
         console.sendMessage(ChatColor.AQUA + getDescription().getName() + " V" + getDescription().getVersion() + " has been enabled!");
         Bukkit.getPluginManager().registerEvents(clUpdate, this);
+
+        // Gets and stored the Classes, Methods, Constructors and Objects that are used later on but do not change
+        // This is to avoid calling very intensive methods every time the action bar is sent.
+        ActionBarAPI.setupReflection(nmsver);
+    }
+
+    private static Class<?> craftPlayerClass, packetClass, chatSerializerComponentClass, iChatBaseComponentClass;
+    private static Constructor<?> constPacketPlayOutChat, constChatComponent;
+    private static Method newChatBaseComponent;
+    private static Object ChatMessageType_GAME_INFO;
+
+    private static boolean reflectionSetup = false;
+    private static boolean useByteConstructor = false;
+
+    /**
+     * Gathers and stores the necessary reflection results for use in sending the packets.
+     *
+     * Reflection is not cheap and most operations don't need to be done multiple times.
+     * Get once, use forever.
+     *
+     * @param nmsver The version string of the current NMS package.
+     */
+    private static void setupReflection (String nmsver) {
+        try {
+            craftPlayerClass = Class.forName("org.bukkit.craftbukkit." + nmsver + ".entity.CraftPlayer");
+            Class<?> packetPlayOutChatClass = Class.forName("net.minecraft.server." + nmsver + ".PacketPlayOutChat");
+            packetClass = Class.forName("net.minecraft.server." + nmsver + ".Packet");
+            if (useOldMethods) {
+                chatSerializerComponentClass = Class.forName("net.minecraft.server." + nmsver + ".ChatSerializer");
+                iChatBaseComponentClass = Class.forName("net.minecraft.server." + nmsver + ".IChatBaseComponent");
+                constPacketPlayOutChat = packetPlayOutChatClass.getConstructor(iChatBaseComponentClass, byte.class);
+                newChatBaseComponent = findMethod(chatSerializerComponentClass, "a", String.class);
+            } else {
+                chatSerializerComponentClass = Class.forName("net.minecraft.server." + nmsver + ".ChatComponentText");
+                iChatBaseComponentClass = Class.forName("net.minecraft.server." + nmsver + ".IChatBaseComponent");
+                Class<?> chatMessageTypeClass = Class.forName("net.minecraft.server." + nmsver + ".ChatMessageType");
+                Object[] chatMessageTypes = chatMessageTypeClass.getEnumConstants();
+                for (Object obj : chatMessageTypes) {
+                    if (obj.toString().equals("GAME_INFO")) {
+                        ChatMessageType_GAME_INFO = obj;
+                    }
+                }
+                try {
+                    constPacketPlayOutChat = packetPlayOutChatClass.getConstructor(iChatBaseComponentClass, chatMessageTypeClass);
+                } catch (NoSuchMethodException e) {
+                    constPacketPlayOutChat = packetPlayOutChatClass.getConstructor(iChatBaseComponentClass, byte.class);
+                    useByteConstructor = true;
+                }
+                constChatComponent = chatSerializerComponentClass.getConstructor(String.class);
+            }
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+            return;
+        }
+        reflectionSetup = true;
+    }
+
+    /**
+     * <b>Class.getDeclaredField(...)</b> returns matching field regardless of publicity of the exact class, excluding inheritance. <br/>
+     * <b>Class.getField(...)</b> returns matching field that are public, including inheritance. <br/>
+     * Neither of these can get a private or protected field from a superclass, or a public field from a protected or private class.
+     *
+     * @param clazz The class from which to search
+     * @param name The name of the desired field;
+     * @return A matching field the highest up the inheritance
+     * @throws NoSuchFieldException if no such field is found within the inheritance.
+     */
+    private static Field findField(Class<?> clazz, String name) throws NoSuchFieldException {
+        Field field;
+        try {
+            field = clazz.getDeclaredField(name);
+            field.setAccessible(true);
+        } catch (NoSuchFieldException e) {
+            if (clazz == Object.class) throw e;
+            field = findField(clazz.getSuperclass(), name);
+        }
+        return field;
+    }
+
+    /**
+     * <b>Class.getDeclaredMethod(...)</b> returns matching method regardless of publicity of the exact class, excluding inheritance. <br/>
+     * <b>Class.getMethod(...)</b> returns matching method that are public, including inheritance. <br/>
+     * Neither of these can get a private or protected method from a superclass, or a public method from a protected or private class.
+     *
+     * @param clazz The class from which to search
+     * @param name The name of the desired method;
+     * @param types The parameter classes for the desired method
+     * @return A matching method the highest up the inheritance
+     * @throws NoSuchMethodException if no such method is found within the inheritance.
+     */
+    private static Method findMethod(Class<?> clazz, String name, Class... types) throws NoSuchMethodException {
+        Method method;
+        try {
+            method = clazz.getDeclaredMethod(name, types);
+            method.setAccessible(true);
+        } catch (NoSuchMethodException e) {
+            if (clazz == Object.class) throw e;
+            method = findMethod(clazz.getSuperclass(), name, types);
+        }
+        return method;
     }
 
     public static void sendActionBar(Player player, String message) {
         if (!player.isOnline()) {
             return; // Player may have logged out
         }
+        if (!reflectionSetup) return; // Setting up reflection failed, can not continue.
 
         // Call the event, if cancelled don't send Action Bar
         ActionBarMessageEvent actionBarMessageEvent = new ActionBarMessageEvent(player, message);
@@ -52,42 +154,45 @@ public class ActionBarAPI extends JavaPlugin implements Listener {
             return;
 
         try {
-            Class<?> craftPlayerClass = Class.forName("org.bukkit.craftbukkit." + nmsver + ".entity.CraftPlayer");
-            Object craftPlayer = craftPlayerClass.cast(player);
             Object packet;
-            Class<?> packetPlayOutChatClass = Class.forName("net.minecraft.server." + nmsver + ".PacketPlayOutChat");
-            Class<?> packetClass = Class.forName("net.minecraft.server." + nmsver + ".Packet");
             if (useOldMethods) {
-                Class<?> chatSerializerClass = Class.forName("net.minecraft.server." + nmsver + ".ChatSerializer");
-                Class<?> iChatBaseComponentClass = Class.forName("net.minecraft.server." + nmsver + ".IChatBaseComponent");
-                Method m3 = chatSerializerClass.getDeclaredMethod("a", String.class);
-                Object cbc = iChatBaseComponentClass.cast(m3.invoke(chatSerializerClass, "{\"text\": \"" + message + "\"}"));
-                packet = packetPlayOutChatClass.getConstructor(new Class<?>[]{iChatBaseComponentClass, byte.class}).newInstance(cbc, (byte) 2);
+                Object cbc = iChatBaseComponentClass.cast(newChatBaseComponent.invoke(chatSerializerComponentClass, "{\"text\": \"" + message + "\"}"));
+                packet = constPacketPlayOutChat.newInstance(cbc, (byte) 2);
             } else {
-                Class<?> chatComponentTextClass = Class.forName("net.minecraft.server." + nmsver + ".ChatComponentText");
-                Class<?> iChatBaseComponentClass = Class.forName("net.minecraft.server." + nmsver + ".IChatBaseComponent");
-                try {
-                    Class<?> chatMessageTypeClass = Class.forName("net.minecraft.server." + nmsver + ".ChatMessageType");
-                    Object[] chatMessageTypes = chatMessageTypeClass.getEnumConstants();
-                    Object chatMessageType = null;
-                    for (Object obj : chatMessageTypes) {
-                        if (obj.toString().equals("GAME_INFO")) {
-                            chatMessageType = obj;
-                        }
-                    }
-                    Object chatCompontentText = chatComponentTextClass.getConstructor(new Class<?>[]{String.class}).newInstance(message);
-                    packet = packetPlayOutChatClass.getConstructor(new Class<?>[]{iChatBaseComponentClass, chatMessageTypeClass}).newInstance(chatCompontentText, chatMessageType);
-                } catch (ClassNotFoundException cnfe) {
-                    Object chatCompontentText = chatComponentTextClass.getConstructor(new Class<?>[]{String.class}).newInstance(message);
-                    packet = packetPlayOutChatClass.getConstructor(new Class<?>[]{iChatBaseComponentClass, byte.class}).newInstance(chatCompontentText, (byte) 2);
+                if (useByteConstructor) {
+
+                    Object chatCompontentText = constChatComponent.newInstance(message);
+                    packet = constPacketPlayOutChat.newInstance(chatCompontentText, (byte) 2);
+                }
+                else {
+                    Object chatCompontentText = constChatComponent.newInstance(message);
+                    packet = constPacketPlayOutChat.newInstance(chatCompontentText, ChatMessageType_GAME_INFO);
                 }
             }
-            Method craftPlayerHandleMethod = craftPlayerClass.getDeclaredMethod("getHandle");
-            Object craftPlayerHandle = craftPlayerHandleMethod.invoke(craftPlayer);
-            Field playerConnectionField = craftPlayerHandle.getClass().getDeclaredField("playerConnection");
-            Object playerConnection = playerConnectionField.get(craftPlayerHandle);
-            Method sendPacketMethod = playerConnection.getClass().getDeclaredMethod("sendPacket", packetClass);
-            sendPacketMethod.invoke(playerConnection, packet);
+            sendPlayerPacket(player, packet);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static Method getHandleMethod = null;
+    private static Field playerConnectionField = null;
+    private static Method sendPacketMethod = null;
+
+    private static void sendPlayerPacket(Player pl, Object packet) {
+        Object handle;
+
+        Object craftPlayer = craftPlayerClass.cast(pl);
+
+        try {
+            if (getHandleMethod == null) getHandleMethod = findMethod(craftPlayerClass, "getHandle");
+            handle = getHandleMethod.invoke(craftPlayer);
+
+            if (playerConnectionField == null) playerConnectionField = findField(handle.getClass(), "playerConnection");
+            Object connection = playerConnectionField.get(handle);
+
+            if (sendPacketMethod == null) sendPacketMethod = findMethod(connection.getClass(), "sendPacket", packetClass);
+            sendPacketMethod.invoke(connection, packet);
         } catch (Exception e) {
             e.printStackTrace();
         }
